@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <stdio.h>
 
+#include "lbfgs.h"
+
 const double epsilon = 1e-4;
 
 // Thread-local random number generator
@@ -177,8 +179,8 @@ Polygon clip_polygon(const Polygon& subject_polygon, const Vector& point_on_line
     return out_polygon;
 }
 
-std::vector<Polygon> compute_voronoi(const std::vector<Vector>& sites) {
-    std::vector<Polygon> voronoi_cells(sites.size());
+std::vector<Polygon> compute_power_diagram(const std::vector<Vector>& sites, const std::vector<double>& weights) {
+    std::vector<Polygon> power_cells(sites.size());
     Polygon bounding_box;
     bounding_box.vertices.push_back(Vector(-1, -1));
     bounding_box.vertices.push_back(Vector(2, -1));
@@ -192,32 +194,175 @@ std::vector<Polygon> compute_voronoi(const std::vector<Vector>& sites) {
             if (i == j) continue;
 
             Vector midpoint = (sites[i] + sites[j]) * 0.5;
-            Vector normal = sites[j] - sites[i];
+            Vector p_ij = sites[j] - sites[i];
+            double w_diff = weights[i] - weights[j];
+            double dist_sq = p_ij.norm2();
+            
+            Vector point_on_line = midpoint + (w_diff / (2 * dist_sq)) * p_ij;
+            Vector normal = p_ij;
 
-            cell = clip_polygon(cell, midpoint, normal);
+            cell = clip_polygon(cell, point_on_line, normal);
         }
-        voronoi_cells[i] = cell;
+        power_cells[i] = cell;
     }
 
-    return voronoi_cells;
+    return power_cells;
+}
+
+struct LbfgsPayload {
+    const std::vector<Vector>* sites;
+    const std::vector<double>* target_areas;
+};
+
+double polygon_area(const Polygon& p) {
+    double area = 0.0;
+    if (p.vertices.size() < 3) return 0.0;
+    for (size_t i = 0; i < p.vertices.size(); ++i) {
+        const Vector& v1 = p.vertices[i];
+        const Vector& v2 = p.vertices[(i + 1) % p.vertices.size()];
+        area += v1[0] * v2[1] - v2[0] * v1[1];
+    }
+    return area / 2.0;
+}
+
+double polygon_integral_sq_dist(const Polygon& p, const Vector& site) {
+    if (p.vertices.empty()) return 0.0;
+    
+    double integral = 0.0;
+    double P_ix = site[0];
+    double P_iy = site[1];
+    double P_i_norm2 = site.norm2();
+
+    for (size_t k = 0; k < p.vertices.size(); ++k) {
+        const Vector& v_prev = p.vertices[k];
+        const Vector& v_curr = p.vertices[(k + 1) % p.vertices.size()];
+        double Xk_m1 = v_prev[0];
+        double Yk_m1 = v_prev[1];
+        double Xk = v_curr[0];
+        double Yk = v_curr[1];
+
+        double term1 = Xk_m1 * Yk - Xk * Yk_m1;
+        double term2 = (Xk_m1 * Xk_m1 + Xk_m1 * Xk + Xk * Xk +
+                        Yk_m1 * Yk_m1 + Yk_m1 * Yk + Yk * Yk -
+                        4 * (P_ix * (Xk_m1 + Xk) + P_iy * (Yk_m1 + Yk)) +
+                        6 * P_i_norm2);
+        
+        integral += term1 * term2;
+    }
+    
+    return integral / 12.0;
+}
+
+static lbfgsfloatval_t evaluate(
+    void *instance,
+    const lbfgsfloatval_t *x,
+    lbfgsfloatval_t *g,
+    const int n,
+    const lbfgsfloatval_t step
+) {
+    LbfgsPayload* payload = (LbfgsPayload*)instance;
+    const auto& sites = *(payload->sites);
+    const auto& target_areas = *(payload->target_areas);
+
+    std::vector<double> weights(n);
+    for (int i = 0; i < n; ++i) weights[i] = x[i];
+
+    std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights);
+    
+    Polygon domain_box;
+    domain_box.vertices.push_back(Vector(0, 0));
+    domain_box.vertices.push_back(Vector(1, 0));
+    domain_box.vertices.push_back(Vector(1, 1));
+    domain_box.vertices.push_back(Vector(0, 1));
+
+    lbfgsfloatval_t objective_g_val = 0.0;
+
+    #pragma omp parallel for reduction(+:objective_g_val)
+    for (int i = 0; i < n; ++i) {
+        Polygon cell = power_diagram[i];
+        for (size_t k=0; k<domain_box.vertices.size(); ++k) {
+            const Vector& p1 = domain_box.vertices[k];
+            const Vector& p2 = domain_box.vertices[(k + 1) % domain_box.vertices.size()];
+            Vector normal(p2[1] - p1[1], p1[0] - p2[0]);
+            cell = clip_polygon(cell, p1, normal);
+        }
+
+        double area = polygon_area(cell);
+        g[i] = area - target_areas[i];
+
+        double integral_term = polygon_integral_sq_dist(cell, sites[i]);
+        objective_g_val += (integral_term - weights[i] * area) + target_areas[i] * weights[i];
+    }
+    
+    return -objective_g_val;
+}
+
+static int progress(
+    void *instance,
+    const lbfgsfloatval_t *x,
+    const lbfgsfloatval_t *g,
+    const lbfgsfloatval_t fx,
+    const lbfgsfloatval_t xnorm,
+    const lbfgsfloatval_t gnorm,
+    const lbfgsfloatval_t step,
+    int n,
+    int k,
+    int ls
+) {
+    // printf("Iteration %d:\n", k);
+    // printf("  fx = %f, gnorm = %f\n", fx, gnorm);
+    return 0;
 }
 
 int main() {
-    int n_sites = 10000;
+    int n_sites = 2000;
     std::vector<Vector> sites(n_sites);
     for (int i = 0; i < n_sites; ++i) {
         sites[i] = Vector(random_double(), random_double());
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
+    // Target areas defined by a Gaussian
+    std::vector<double> target_areas(n_sites);
+    double sigma = 0.1;
+    double sum_lambda = 0;
+    Vector center(0.5, 0.5);
+    for (int i = 0; i < n_sites; ++i) {
+        target_areas[i] = exp(- (sites[i] - center).norm2() / (2*sigma*sigma) );
+        sum_lambda += target_areas[i];
+    }
+    for (int i = 0; i < n_sites; ++i) {
+        target_areas[i] /= sum_lambda;
+    }
 
-    std::vector<Polygon> voronoi_diagram = compute_voronoi(sites);
+    auto start = std::chrono::high_resolution_clock::now();
     
-    save_svg(voronoi_diagram, "voronoi.svg");
+    // L-BFGS optimization
+    lbfgsfloatval_t fx;
+    lbfgsfloatval_t *x = lbfgs_malloc(n_sites);
+    for (int i = 0; i < n_sites; i++) x[i] = 0;
+
+    LbfgsPayload payload;
+    payload.sites = &sites;
+    payload.target_areas = &target_areas;
+    
+    lbfgs_parameter_t param;
+    lbfgs_parameter_init(&param);
+
+    int ret = lbfgs(n_sites, x, &fx, evaluate, progress, &payload, &param);
+
+    std::cout << "L-BFGS optimization finished with status " << ret << std::endl;
+
+    std::vector<double> weights(n_sites);
+    for (int i = 0; i < n_sites; i++) weights[i] = x[i];
+    lbfgs_free(x);
+    
+    std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights);
+    
+    save_svg(power_diagram, "optimal_transport.svg");
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
-    std::cout << "Voronoi diagram with " << n_sites << " sites generated in " << diff.count() << " s.\n";
+    std::cout << "Optimal transport with " << n_sites << " sites generated in " << diff.count() << " s.\n";
 
     return 0;
 }
