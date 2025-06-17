@@ -1,2 +1,3 @@
 *.exe
-for-report/*
+for-report/
+frames*/

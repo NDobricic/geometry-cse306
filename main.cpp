@@ -12,10 +12,15 @@
 #include <string>
 #include <algorithm>
 #include <stdio.h>
+#include <sstream>
 
 #include "lbfgs.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 const double epsilon = 1e-4;
+#define M_PI 3.14159265358979323846
 
 // Thread-local random number generator
 double random_double() {
@@ -99,6 +104,76 @@ void save_svg(const std::vector<Polygon> &polygons, std::string filename, std::s
 	fclose(f);
 }
 
+template <typename T> int sgn(T val) {
+    return (T(0) < val) - (val < T(0));
+}
+
+void save_frame(const std::vector<Polygon> &cells, std::string filename, int frameid = 0) {
+    int W = 1000, H = 1000;
+    std::vector<unsigned char> image(W*H * 3, 255);
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < cells.size(); i++) {
+
+        double bminx = 1E9, bminy = 1E9, bmaxx = -1E9, bmaxy = -1E9;
+        for (int j = 0; j < cells[i].vertices.size(); j++) {
+            bminx = std::min(bminx, cells[i].vertices[j][0]);
+            bminy = std::min(bminy, cells[i].vertices[j][1]);
+            bmaxx = std::max(bmaxx, cells[i].vertices[j][0]);
+            bmaxy = std::max(bmaxy, cells[i].vertices[j][1]);
+        }
+        bminx = std::min(W-1., std::max(0., W * bminx));
+        bminy = std::min(H-1., std::max(0., H * bminy));
+        bmaxx = std::max(W-1., std::max(0., W * bmaxx));
+        bmaxy = std::max(H-1., std::max(0., H * bmaxy));
+
+        for (int y = bminy; y < bmaxy; y++) {
+            for (int x = bminx; x < bmaxx; x++) {
+                int prevSign = 0;
+                bool isInside = true;
+                double mindistEdge = 1E9;
+                for (int j = 0; j < cells[i].vertices.size(); j++) {
+                    double x0 = cells[i].vertices[j][0] * W;
+                    double y0 = cells[i].vertices[j][1] * H;
+                    double x1 = cells[i].vertices[(j + 1) % cells[i].vertices.size()][0] * W;
+                    double y1 = cells[i].vertices[(j + 1) % cells[i].vertices.size()][1] * H;
+                    double det = (x - x0)*(y1-y0) - (y - y0)*(x1-x0);
+                    int sign = sgn(det);
+                    if (prevSign == 0) prevSign = sign; else
+                        if (sign == 0) sign = prevSign; else
+                        if (sign != prevSign) {
+                            isInside = false;
+                            break;
+                        }
+                    prevSign = sign;
+                    double edgeLen = sqrt((x1 - x0)*(x1 - x0) + (y1 - y0)*(y1 - y0));
+                    if (edgeLen > 1e-9) {
+                        double distEdge = std::abs(det)/ edgeLen;
+                        double dotp = (x - x0)*(x1 - x0) + (y - y0)*(y1 - y0);
+                        if (dotp<0 || dotp>edgeLen*edgeLen) distEdge = 1E9;
+                        mindistEdge = std::min(mindistEdge, distEdge);
+                    }
+                }
+                if (isInside) {
+                    //if (i < N) {   // the N first particles may represent fluid, displayed in blue
+                    // image[((H - y - 1)*W + x) * 3] = 0;
+                    // image[((H - y - 1)*W + x) * 3 + 1] = 0;
+                    // image[((H - y - 1)*W + x) * 3 + 2] = 255;
+                    //}
+                    if (mindistEdge <= 2) {
+                        image[((H - y - 1)*W + x) * 3] = 0;
+                        image[((H - y - 1)*W + x) * 3 + 1] = 0;
+                        image[((H - y - 1)*W + x) * 3 + 2] = 0;
+                    }
+
+                }
+                
+            }
+        }
+    }
+    std::ostringstream os;
+    os << "frames/" << filename << std::setfill('0') << std::setw(3) << frameid << ".png";
+    stbi_write_png(os.str().c_str(), W, H, 3, &image[0], 0);
+}
 
 // Adds one frame of an animated svg file. frameid is the frame number (between 0 and nbframes-1).
 // polygons is a list of polygons, describing the current frame.
@@ -164,22 +239,28 @@ Polygon clip_polygon(const Polygon& subject_polygon, const Vector& point_on_line
         if (is_current_inside) {
             if (!is_prev_inside) {
                 Vector edge_direction = current_vertex - prev_vertex;
-                double t = dot(point_on_line - prev_vertex, normal) / dot(edge_direction, normal);
-                Vector intersection_point = prev_vertex + t * edge_direction;
-                out_polygon.vertices.push_back(intersection_point);
+                double denominator = dot(edge_direction, normal);
+                if (std::abs(denominator) > 1e-9) {
+                    double t = dot(point_on_line - prev_vertex, normal) / denominator;
+                    Vector intersection_point = prev_vertex + t * edge_direction;
+                    out_polygon.vertices.push_back(intersection_point);
+                }
             }
             out_polygon.vertices.push_back(current_vertex);
         } else if (is_prev_inside) {
             Vector edge_direction = current_vertex - prev_vertex;
-            double t = dot(point_on_line - prev_vertex, normal) / dot(edge_direction, normal);
-            Vector intersection_point = prev_vertex + t * edge_direction;
-            out_polygon.vertices.push_back(intersection_point);
+            double denominator = dot(edge_direction, normal);
+            if (std::abs(denominator) > 1e-9) {
+                double t = dot(point_on_line - prev_vertex, normal) / denominator;
+                Vector intersection_point = prev_vertex + t * edge_direction;
+                out_polygon.vertices.push_back(intersection_point);
+            }
         }
     }
     return out_polygon;
 }
 
-std::vector<Polygon> compute_power_diagram(const std::vector<Vector>& sites, const std::vector<double>& weights) {
+std::vector<Polygon> compute_power_diagram(const std::vector<Vector>& sites, const std::vector<double>& weights, double w_air) {
     std::vector<Polygon> power_cells(sites.size());
     Polygon bounding_box;
     bounding_box.vertices.push_back(Vector(-1, -1));
@@ -198,11 +279,33 @@ std::vector<Polygon> compute_power_diagram(const std::vector<Vector>& sites, con
             double w_diff = weights[i] - weights[j];
             double dist_sq = p_ij.norm2();
             
-            Vector point_on_line = midpoint + (w_diff / (2 * dist_sq)) * p_ij;
+            if (dist_sq < 1e-7) continue;
+            Vector point_on_line = midpoint + (w_diff / (2 * dist_sq + 1e-7)) * p_ij;
             Vector normal = p_ij;
 
             cell = clip_polygon(cell, point_on_line, normal);
         }
+
+        // Clip by disk
+        double r_sq = weights[i] - w_air;
+        if (r_sq > 0) {
+            double r = sqrt(r_sq);
+            Polygon disk_poly;
+            int n_sides = 64;
+            for(int k=0; k<n_sides; ++k) {
+                double angle = 2 * M_PI * k / n_sides;
+                disk_poly.vertices.push_back(sites[i] + Vector(r*cos(angle), r*sin(angle)));
+            }
+            for(int k=0; k<n_sides; ++k) {
+                const Vector& p1 = disk_poly.vertices[k];
+                const Vector& p2 = disk_poly.vertices[(k + 1) % n_sides];
+                Vector normal(p2[1] - p1[1], p1[0] - p2[0]);
+                cell = clip_polygon(cell, p1, normal);
+            }
+        } else {
+             cell.vertices.clear();
+        }
+
         power_cells[i] = cell;
     }
 
@@ -211,7 +314,7 @@ std::vector<Polygon> compute_power_diagram(const std::vector<Vector>& sites, con
 
 struct LbfgsPayload {
     const std::vector<Vector>* sites;
-    const std::vector<double>* target_areas;
+    double desired_fluid_volume;
 };
 
 double polygon_area(const Polygon& p) {
@@ -223,6 +326,25 @@ double polygon_area(const Polygon& p) {
         area += v1[0] * v2[1] - v2[0] * v1[1];
     }
     return area / 2.0;
+}
+
+Vector polygon_centroid(const Polygon& p) {
+    if (p.vertices.size() < 3) return Vector();
+    double area = 0;
+    Vector centroid;
+    for (size_t i = 0; i < p.vertices.size(); ++i) {
+        const Vector& v1 = p.vertices[i];
+        const Vector& v2 = p.vertices[(i + 1) % p.vertices.size()];
+        double cross_prod = v1[0] * v2[1] - v2[0] * v1[1];
+        area += cross_prod;
+        centroid[0] += (v1[0] + v2[0]) * cross_prod;
+        centroid[1] += (v1[1] + v2[1]) * cross_prod;
+    }
+    area /= 2.0;
+    if (std::abs(area) < 1e-9) return Vector();
+    centroid[0] /= (6.0 * area);
+    centroid[1] /= (6.0 * area);
+    return centroid;
 }
 
 double polygon_integral_sq_dist(const Polygon& p, const Vector& site) {
@@ -262,12 +384,14 @@ static lbfgsfloatval_t evaluate(
 ) {
     LbfgsPayload* payload = (LbfgsPayload*)instance;
     const auto& sites = *(payload->sites);
-    const auto& target_areas = *(payload->target_areas);
+    const double desired_fluid_volume = payload->desired_fluid_volume;
 
-    std::vector<double> weights(n);
-    for (int i = 0; i < n; ++i) weights[i] = x[i];
+    int n_sites = sites.size();
+    std::vector<double> weights(n_sites);
+    for (int i = 0; i < n_sites; ++i) weights[i] = x[i];
+    double w_air = x[n_sites];
 
-    std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights);
+    std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights, w_air);
     
     Polygon domain_box;
     domain_box.vertices.push_back(Vector(0, 0));
@@ -275,10 +399,12 @@ static lbfgsfloatval_t evaluate(
     domain_box.vertices.push_back(Vector(1, 1));
     domain_box.vertices.push_back(Vector(0, 1));
 
-    lbfgsfloatval_t objective_g_val = 0.0;
+    lbfgsfloatval_t objective_val = 0.0;
+    std::vector<double> areas(n_sites);
+    double sum_areas = 0;
 
-    #pragma omp parallel for reduction(+:objective_g_val)
-    for (int i = 0; i < n; ++i) {
+    #pragma omp parallel for reduction(+:objective_val, sum_areas)
+    for (int i = 0; i < n_sites; ++i) {
         Polygon cell = power_diagram[i];
         for (size_t k=0; k<domain_box.vertices.size(); ++k) {
             const Vector& p1 = domain_box.vertices[k];
@@ -288,13 +414,23 @@ static lbfgsfloatval_t evaluate(
         }
 
         double area = polygon_area(cell);
-        g[i] = area - target_areas[i];
+        areas[i] = area;
+        sum_areas += area;
 
         double integral_term = polygon_integral_sq_dist(cell, sites[i]);
-        objective_g_val += (integral_term - weights[i] * area) + target_areas[i] * weights[i];
+        objective_val += integral_term - weights[i] * area + (desired_fluid_volume / n_sites) * weights[i];
     }
     
-    return -objective_g_val;
+    double area_air = 1.0 - sum_areas;
+    double desired_air_volume = 1.0 - desired_fluid_volume;
+    objective_val += w_air * (desired_air_volume - area_air);
+
+    for(int i=0; i<n_sites; ++i) {
+        g[i] = areas[i] - (desired_fluid_volume / n_sites);
+    }
+    g[n_sites] = area_air - desired_air_volume;
+    
+    return -objective_val;
 }
 
 static int progress(
@@ -315,54 +451,85 @@ static int progress(
 }
 
 int main() {
-    int n_sites = 2000;
+    int n_sites = 512;
+    double fluid_fraction = 0.2;
     std::vector<Vector> sites(n_sites);
-    for (int i = 0; i < n_sites; ++i) {
-        sites[i] = Vector(random_double(), random_double());
-    }
+    std::vector<Vector> velocities(n_sites, Vector(0,0));
 
-    // Target areas defined by a Gaussian
-    std::vector<double> target_areas(n_sites);
-    double sigma = 0.1;
-    double sum_lambda = 0;
+    // Initialize fluid particles in a disk
+    double disk_radius = sqrt(fluid_fraction / M_PI);
     Vector center(0.5, 0.5);
     for (int i = 0; i < n_sites; ++i) {
-        target_areas[i] = exp(- (sites[i] - center).norm2() / (2*sigma*sigma) );
-        sum_lambda += target_areas[i];
-    }
-    for (int i = 0; i < n_sites; ++i) {
-        target_areas[i] /= sum_lambda;
+        double r = disk_radius * sqrt(random_double());
+        double theta = 2 * M_PI * random_double();
+        sites[i] = center + Vector(r * cos(theta), r * sin(theta));
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
-    
-    // L-BFGS optimization
-    lbfgsfloatval_t fx;
-    lbfgsfloatval_t *x = lbfgs_malloc(n_sites);
-    for (int i = 0; i < n_sites; i++) x[i] = 0;
+    // Simulation parameters
+    int n_frames = 960;
+    double dt = 0.002;
+    double epsilon_sq = 0.004 * 0.004;
+    Vector gravity(0, -200);
 
+    lbfgsfloatval_t *x = lbfgs_malloc(n_sites + 1);
+    for (int i = 0; i <= n_sites; i++) x[i] = 0;
     LbfgsPayload payload;
     payload.sites = &sites;
-    payload.target_areas = &target_areas;
-    
+    payload.desired_fluid_volume = fluid_fraction;
     lbfgs_parameter_t param;
     lbfgs_parameter_init(&param);
+    param.m = 10;
 
-    int ret = lbfgs(n_sites, x, &fx, evaluate, progress, &payload, &param);
+    for (int frame = 0; frame < n_frames; ++frame) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // L-BFGS optimization
+        lbfgsfloatval_t fx;
+        int ret = lbfgs(n_sites + 1, x, &fx, evaluate, progress, &payload, &param);
 
-    std::cout << "L-BFGS optimization finished with status " << ret << std::endl;
+        std::vector<double> weights(n_sites);
+        for (int i = 0; i < n_sites; i++) weights[i] = x[i];
+        double w_air = x[n_sites];
+        
+        std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights, w_air);
 
-    std::vector<double> weights(n_sites);
-    for (int i = 0; i < n_sites; i++) weights[i] = x[i];
+        #pragma omp parallel for
+        for (int i = 0; i < n_sites; ++i) {
+            Polygon cell = power_diagram[i];
+             Polygon domain_box;
+            domain_box.vertices.push_back(Vector(0, 0));
+            domain_box.vertices.push_back(Vector(1, 0));
+            domain_box.vertices.push_back(Vector(1, 1));
+            domain_box.vertices.push_back(Vector(0, 1));
+            for (size_t k=0; k<domain_box.vertices.size(); ++k) {
+                const Vector& p1 = domain_box.vertices[k];
+                const Vector& p2 = domain_box.vertices[(k + 1) % domain_box.vertices.size()];
+                Vector normal(p2[1] - p1[1], p1[0] - p2[0]);
+                cell = clip_polygon(cell, p1, normal);
+            }
+            power_diagram[i] = cell; // for saving frame
+
+            Vector centroid = polygon_centroid(cell);
+            Vector spring_force = (centroid - sites[i]) / epsilon_sq;
+            
+            Vector total_force = spring_force + gravity;
+            velocities[i] = velocities[i] + dt * total_force;
+            sites[i] = sites[i] + dt * velocities[i];
+
+            // Boundary conditions
+            if (sites[i][0] < 0) { sites[i][0] = 0; velocities[i][0] *= -0.5; }
+            if (sites[i][0] > 1) { sites[i][0] = 1; velocities[i][0] *= -0.5; }
+            if (sites[i][1] < 0) { sites[i][1] = 0; velocities[i][1] *= -0.5; }
+            if (sites[i][1] > 1) { sites[i][1] = 1; velocities[i][1] *= -0.5; }
+        }
+        
+        save_frame(power_diagram, "fluid_frame_", frame);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = end - start;
+        std::cout << "Frame " << frame << " generated in " << diff.count() << std::endl;
+    }
+
     lbfgs_free(x);
-    
-    std::vector<Polygon> power_diagram = compute_power_diagram(sites, weights);
-    
-    save_svg(power_diagram, "optimal_transport.svg");
-
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end - start;
-    std::cout << "Optimal transport with " << n_sites << " sites generated in " << diff.count() << " s.\n";
-
     return 0;
 }
